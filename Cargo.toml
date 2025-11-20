@@ -1,0 +1,16 @@
+[package]
+name = "ormcle"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ormcle_core = { path = "./ormcle_core", default-features = false }
+
+[workspace]
+members = ["ormcle_core", "ormcle_macro"]
+
+[features]
+default = []
+blocking = ["ormcle_core/blocking"]
+tokio = ["ormcle_core/tokio"]
+actix = ["ormcle_core/actix"]
