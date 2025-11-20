@@ -3,14 +3,16 @@ name = "ormcle"
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
-ormcle_core = { path = "./ormcle_core", default-features = false }
-
 [workspace]
 members = ["ormcle_core", "ormcle_macro"]
 
+[dependencies]
+sibyl = { version = "0.6.22" }
+tokio = { version = "1.48.0", optional = true }
+ormcle_macro = { path = "./ormcle_macro"}
+
 [features]
-default = []
-blocking = ["ormcle_core/blocking"]
-tokio = ["ormcle_core/tokio"]
-actix = ["ormcle_core/actix"]
+blocking = ["sibyl/blocking"]
+nonblocking = ["sibyl/nonblocking"]
+tokio = ["nonblocking", "tokio/rt-multi-thread", "sibyl/tokio"]
+actix  = ["nonblocking", "sibyl/actix"]
