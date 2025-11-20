@@ -84,15 +84,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ormcle_core"
-version = "0.1.0"
-dependencies = [
- "ormcle_macro",
- "sibyl",
- "tokio",
-]
-
-[[package]]
 name = "ormcle_macro"
 version = "0.1.0"
 
