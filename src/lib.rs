@@ -1,11 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use crate::CustomersRepository;
     use ormcle_macro::Table;
 
     #[derive(Table, Debug)]
     pub struct Customers {
-        #[id(0)]
+        #[id]
         customer_id: i32,
         email_address: Option<String>,
         full_name: String,
