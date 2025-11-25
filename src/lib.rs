@@ -1,87 +1,48 @@
+use ormcle_macro::Table;
+
+#[derive(Table, Debug)]
+#[ormcle(table_name = "CUSTOMERS")]
+pub struct CustomersStruct {
+    #[ormcle(primary_key, column_name = "CUSTOMER_ID")]
+    id: i32,
+    email_address: Option<String>,
+    full_name: String,
+}
+
 #[cfg(test)]
 mod tests {
-    use ormcle_macro::Table;
+    use crate::CustomersStructRepository;
 
-    #[derive(Table, Debug)]
-    pub struct Customers {
-        #[id]
-        customer_id: i32,
-        email_address: Option<String>,
-        full_name: String,
+    #[test]
+    fn find_all_has_data() {
+        let oracle = sibyl::Environment::new().unwrap();
+        let session = oracle
+            .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE") // just a generic test db, okay to leak
+            .unwrap();
+        let repo = CustomersStructRepository { session };
+        let result = repo.find_all().unwrap();
+        assert!(!result.is_empty())
     }
 
     #[test]
-    fn connect_to_db() {
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let oracle = sibyl::Environment::new().unwrap();
-                    let session = oracle
-                        .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE")
-                        .await
-                        .unwrap();
-
-                    session.ping().await.unwrap();
-                });
-            });
-        });
+    fn find_by_id_has_data_if_valid_id() {
+        let oracle = sibyl::Environment::new().unwrap();
+        let session = oracle
+            .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE") // just a generic test db, okay to leak
+            .unwrap();
+        let repo = CustomersStructRepository { session };
+        let result = repo.find_by_id(1);
+        assert!(result.is_ok_and(|r| r.is_some()))
     }
 
     #[test]
-    fn non_existing_id_returns_none() {
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let oracle = sibyl::Environment::new().unwrap();
-                    let session = oracle
-                        .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE")
-                        .await
-                        .unwrap();
-                    let repo = CustomersRepository::new(&session);
-                    assert!(repo.find_by_id(0).await.is_ok_and(|r| r.is_none()))
-                });
-            });
-        });
-    }
-
-    #[test]
-    fn query_single_successfully() {
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let oracle = sibyl::Environment::new().unwrap();
-                    let session = oracle
-                        .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE")
-                        .await
-                        .unwrap();
-                    let repo = CustomersRepository::new(&session);
-                    let result = repo.find_by_id(1).await;
-                    dbg!(&result);
-                    assert!(result.is_ok_and(|res| res.is_some()))
-                });
-            });
-        });
-    }
-
-    #[test]
-    fn query_multiple_successfuly() {
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(async {
-                    let oracle = sibyl::Environment::new().unwrap();
-                    let session = oracle
-                        .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE")
-                        .await
-                        .unwrap();
-                    let repo = CustomersRepository::new(&session);
-                    let result = repo.find_all().await;
-                    assert!(result.is_ok())
-                });
-            });
-        });
+    fn find_by_id_returns_none_if_not_found() {
+        let oracle = sibyl::Environment::new().unwrap();
+        let session = oracle
+            .connect("127.0.0.1:1521/ORCLPDB1", "PDBADMIN", "ORACLE") // just a generic test db, okay to leak
+            .unwrap();
+        let repo = CustomersStructRepository { session };
+        let result = repo.find_by_id(0);
+        assert!(result.is_ok_and(|r| r.is_none()))
     }
 }
