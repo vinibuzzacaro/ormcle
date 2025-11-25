@@ -1,172 +1,375 @@
-use proc_macro::{TokenStream, TokenTree};
+use proc_macro::{Group, TokenStream, TokenTree};
 
-macro_rules! goto_next_punct {
-    ($punct: expr, $tokens: expr) => {
-        loop {
-            match $tokens.next() {
-                Some(TokenTree::Punct(punct)) if punct.as_char().eq(&$punct) => break,
-                None => break,
+#[derive(Debug)]
+enum Attribute {
+    Struct {
+        table_name: Option<String>,
+    },
+    Field {
+        column_name: Option<String>,
+        primary_key: bool,
+    },
+}
+
+#[derive(Debug)]
+struct Entity {
+    struct_name: String,
+    attr: Option<Attribute>,
+}
+
+#[derive(Debug)]
+struct Field {
+    field_name: String,
+    field_type: String,
+    attr: Option<Attribute>,
+}
+
+impl Field {
+    fn is_pk(&self) -> bool {
+        self.attr.as_ref().map_or(false, |attr| match attr {
+            Attribute::Struct { .. } => unreachable!(),
+            Attribute::Field { primary_key, .. } => *primary_key,
+        })
+    }
+
+    fn try_from_iter(ts: &mut impl Iterator<Item = TokenTree>) -> Option<Self> {
+        let mut attr = None;
+        while let Some(tt) = ts.next() {
+            match tt {
+                TokenTree::Punct(p) if p.as_char().eq(&'#') => {
+                    let mut group = match ts.next() {
+                        Some(TokenTree::Group(g)) => g.stream().into_iter(),
+                        _ => unreachable!(),
+                    };
+                    let ormcle_found = group.next().map_or(
+                        false,
+                        |tt| matches!(tt, TokenTree::Ident(i) if i.to_string().eq("ormcle")),
+                    );
+                    if !ormcle_found {
+                        continue;
+                    }
+                    let attr_group = match group.next() {
+                        Some(TokenTree::Group(g)) => g,
+                        _ => unreachable!(),
+                    };
+                    attr = Attribute::try_parse_field(attr_group);
+                }
+                TokenTree::Ident(i) => {
+                    let field_name = i.to_string();
+                    let colon_found = ts
+                        .next()
+                        .map(|tt| matches!(tt, TokenTree::Punct(p) if p.as_char().eq(&':')))
+                        .unwrap_or(false);
+                    if !colon_found {
+                        return None;
+                    }
+                    let field_type = match ts.next() {
+                        Some(TokenTree::Ident(i)) => {
+                            let mut ty = i.to_string();
+                            let opening_bracket = ts
+                                .next()
+                                .map(|tt| matches!(tt, TokenTree::Punct(p) if p.as_char().eq(&'<')))
+                                .unwrap_or(false);
+                            if !opening_bracket {
+                                ty
+                            } else {
+                                ty.push('<');
+                                loop {
+                                    match ts.next() {
+                                        Some(TokenTree::Punct(p)) => {
+                                            let p_as_char = p.as_char();
+                                            let type_end = p_as_char.eq(&'>');
+                                            ty.push(p_as_char);
+                                            if type_end {
+                                                break;
+                                            }
+                                        }
+                                        Some(TokenTree::Ident(i)) => {
+                                            ty.push_str(i.to_string().as_str());
+                                        }
+                                        None => return None,
+                                        _ => unreachable!(),
+                                    }
+                                }
+                                ty
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    return Some(Self {
+                        field_name,
+                        field_type,
+                        attr,
+                    });
+                }
                 _ => continue,
             }
         }
-    };
+        None
+    }
 }
 
-macro_rules! append_col_getter {
-    ($field_name: expr, $fields: expr) => {
-        $fields.push_str(&$field_name);
-        $fields.push_str(": row.get(\"");
-        $fields.push_str(&$field_name.to_uppercase());
-        $fields.push_str("\")?,");
-    };
-}
+impl Attribute {
+    fn default_struct() -> Self {
+        Self::Struct { table_name: None }
+    }
 
-fn compile_error(msg: &str) -> TokenStream {
-    let mut result = String::with_capacity(18 + msg.len());
-    result.push_str("compile_error!(\"");
-    result.push_str(msg);
-    result.push_str("\")");
-    result.parse().unwrap()
-}
-
-#[proc_macro_derive(Table, attributes(id))]
-pub fn derive_table(input: TokenStream) -> TokenStream {
-    let len = input.to_string().len();
-    let mut tokens = input.into_iter();
-    let mut table_name = None;
-    while let Some(token) = tokens.next() {
-        if let TokenTree::Ident(ident) = token {
-            let token = ident
-                .to_string()
-                .eq("struct")
-                .then(|| tokens.next())
-                .flatten();
-            if let Some(TokenTree::Ident(ident)) = token {
-                table_name = Some(ident.to_string());
-                break;
-            }
+    fn default_field() -> Self {
+        Self::Field {
+            column_name: None,
+            primary_key: false,
         }
     }
-    let Some(table_name) = table_name else {
-        return compile_error("Expected a struct definition");
-    };
-    let Some(mut tokens) = tokens.find_map(|tt| match tt {
-        TokenTree::Group(group) => Some(group.stream().into_iter()),
-        _ => None,
-    }) else {
-        return compile_error("Empty struct is not derivable as Table");
-    };
-    let mut fields = String::with_capacity(len);
-    let mut id: Option<(String, String)> = None;
-    while let Some(token) = tokens.next() {
-        match token {
-            TokenTree::Ident(ident) => {
-                let field_name = ident.to_string();
-                append_col_getter!(field_name, fields);
-                goto_next_punct!(',', tokens);
-            }
-            TokenTree::Punct(punct) if punct.as_char().eq(&'#') => {
-                let id_flag_found = tokens
-                    .next()
-                    .and_then(|tt| {
-                        if let TokenTree::Group(g) = tt {
-                            Some(g.stream().into_iter())
-                        } else {
-                            None
-                        }
-                    })
-                    .into_iter()
-                    .flatten()
-                    .any(|tt| matches!(tt, TokenTree::Ident(ident) if ident.to_string().eq("id")));
-                if id.is_some() && id_flag_found {
-                    return compile_error("Entity can have only one field flagged as ID");
+
+    fn with_table_name(self, value: String) -> Self {
+        match self {
+            Attribute::Struct { table_name: _ } => Attribute::Struct {
+                table_name: Some(value),
+            },
+            Attribute::Field { .. } => self,
+        }
+    }
+
+    fn with_column_name(self, value: String) -> Self {
+        match self {
+            Attribute::Struct { .. } => self,
+            Attribute::Field { primary_key, .. } => Attribute::Field {
+                column_name: Some(value),
+                primary_key,
+            },
+        }
+    }
+
+    fn with_primary_key(self) -> Self {
+        match self {
+            Attribute::Struct { .. } => self,
+            Attribute::Field { column_name, .. } => Attribute::Field {
+                column_name,
+                primary_key: true,
+            },
+        }
+    }
+
+    fn try_parse_struct(group: Group) -> Option<Self> {
+        let mut ts = group.stream().into_iter();
+        let mut attr = Attribute::default_struct();
+        while let Some(tt) = ts.next() {
+            match tt {
+                TokenTree::Ident(i) => {
+                    let maybe_field = i.to_string();
+                    let equal_found = ts
+                        .next()
+                        .map(|tt| matches!(tt, TokenTree::Punct(p) if p.as_char().eq(&'=')))
+                        .unwrap_or(false);
+                    if !equal_found {
+                        return None;
+                    }
+                    let maybe_value = match ts.next() {
+                        Some(TokenTree::Literal(l)) => l.to_string().replace("\"", ""),
+                        _ => return None,
+                    };
+                    attr = match maybe_field.as_ref() {
+                        "table_name" => attr.with_table_name(maybe_value),
+                        _ => return None,
+                    };
                 }
-                let field_name = match tokens.next() {
-                    Some(TokenTree::Ident(ident)) => ident.to_string(),
-                    // Some(TokenTree::Group(g)) => g.to_string(),
-                    _ => unreachable!(),
-                };
-                goto_next_punct!(':', tokens);
-                let field_type = match tokens.next() {
-                    Some(TokenTree::Ident(ident)) => ident.to_string(),
-                    Some(TokenTree::Group(group)) => group.to_string(),
-                    _ => unreachable!(),
-                };
-                append_col_getter!(field_name, fields);
-                id = Some((field_name.to_uppercase(), field_type));
-                goto_next_punct!(',', tokens);
+                _ => continue,
             }
+        }
+        Some(attr)
+    }
+
+    fn try_parse_field(group: Group) -> Option<Self> {
+        let mut ts = group.stream().into_iter();
+        let mut attr = Attribute::default_field();
+        let mut some_element = false;
+        while let Some(tt) = ts.next() {
+            some_element = true;
+            match tt {
+                TokenTree::Ident(i) => {
+                    let key = i.to_string();
+                    match key.as_str() {
+                        "primary_key" => attr = attr.with_primary_key(),
+                        _ => {
+                            let equal_found = ts.next().map_or(
+                                false,
+                                |tt| matches!(tt, TokenTree::Punct(p) if p.as_char().eq(&'=')),
+                            );
+                            if !equal_found {
+                                return None;
+                            }
+                            let value = match ts.next() {
+                                Some(TokenTree::Literal(l)) => l.to_string().replace("\"", ""),
+                                _ => unreachable!(),
+                            };
+                            match key.as_str() {
+                                "column_name" => attr = attr.with_column_name(value.to_uppercase()),
+                                _ => continue,
+                            }
+                        }
+                    }
+                }
+                _ => continue,
+            }
+        }
+        some_element.then_some(attr)
+    }
+}
+
+impl Entity {
+    fn try_from_iter(ts: &mut impl Iterator<Item = TokenTree>) -> Option<Self> {
+        let mut attr = None;
+        while let Some(tt) = ts.next() {
+            match tt {
+                TokenTree::Ident(i) if i.to_string().eq("struct") => match ts.next() {
+                    Some(TokenTree::Ident(i)) => {
+                        return Some(Self {
+                            struct_name: i.to_string(),
+                            attr,
+                        });
+                    }
+                    _ => unreachable!(),
+                },
+                TokenTree::Punct(p) if p.as_char().eq(&'#') => {
+                    let mut group = match ts.next() {
+                        Some(TokenTree::Group(g)) => g.stream().into_iter(),
+                        _ => unreachable!(),
+                    };
+                    let ormcle_found = group
+                        .next()
+                        .map(|tt| matches!(tt, TokenTree::Ident(i) if i.to_string().eq("ormcle")))
+                        .unwrap_or(false);
+                    if !ormcle_found {
+                        continue;
+                    }
+                    match group.next() {
+                        Some(TokenTree::Group(g)) => attr = Attribute::try_parse_struct(g),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+        }
+        None
+    }
+}
+
+#[proc_macro_derive(Table, attributes(ormcle))]
+pub fn derive_table(input: TokenStream) -> TokenStream {
+    let mut ts = input.into_iter();
+    let entity = Entity::try_from_iter(&mut ts).unwrap();
+    let table_name = entity
+        .attr
+        .and_then(|attr| match attr {
+            Attribute::Struct { table_name } => table_name,
+            Attribute::Field { .. } => None,
+        })
+        .unwrap_or(entity.struct_name.clone());
+    let struct_name = entity.struct_name;
+    let mut fields = String::new();
+    let mut ts = loop {
+        match ts.next() {
+            Some(TokenTree::Group(g)) => break g.stream().into_iter(),
+            None => unreachable!(),
             _ => continue,
+        }
+    };
+    let mut id: Option<Field> = None;
+    while let Some(field) = Field::try_from_iter(&mut ts) {
+        let column_name = field
+            .attr
+            .as_ref()
+            .and_then(|attr| match attr {
+                Attribute::Struct { .. } => unreachable!(),
+                Attribute::Field { column_name, .. } => column_name.clone(),
+            })
+            .unwrap_or(field.field_name.to_uppercase());
+        fields.push_str(&field.field_name);
+        fields.push_str(": row.get(\"");
+        fields.push_str(&column_name);
+        fields.push_str("\")?,");
+        match (&id, field.is_pk()) {
+            (None, true) => id = Some(field),
+            (Some(_), true) => panic!("Only one field can be flagged as ID"),
+            _ => (),
         }
     }
     let id_dependent_code = match id {
-        Some((name, typ)) => format!("
+        Some(i) => {
+            let column_name = i
+                .attr
+                .as_ref()
+                .and_then(|attr| match attr {
+                    Attribute::Struct { .. } => unreachable!(),
+                    Attribute::Field { column_name, .. } => column_name.clone(),
+                })
+                .unwrap_or(i.field_name.to_uppercase());
+            format!("
             #[cfg(feature = \"nonblocking\")]
-            pub async fn find_by_id(&'a self, id: {typ}) -> ::sibyl::Result<Option<{table_name}>> {{
-                let stmt = self.session.prepare(\"SELECT * FROM {table_name} WHERE {name} = :ID\").await?;
+            pub async fn find_by_id(&'a self, id: {typ}) -> ::sibyl::Result<Option<{struct}>> {{
+                let stmt = self.session.prepare(\"SELECT * FROM {table} WHERE {name} = :ID\").await?;
                 let rows = stmt.query((\"ID\", id)).await?;
                 if let Some(row) = rows.next().await? {{
-                    Ok(Some({table_name}  {{ {fields} }}))
+                    Ok(Some({struct}  {{ {fields} }}))
                 }} else {{
                     Ok(None)
                 }}
-            }}                    
+            }}
 
             #[cfg(feature = \"blocking\")]
-            pub fn find_by_id(&'a self, id: {typ}) -> ::sibyl::Result<Option<{table_name}>> {{
-                let stmt = self.session.prepare(\"SELECT * FROM {table_name} WHERE {name} = :ID\")?;
+            pub fn find_by_id(&'a self, id: {typ}) -> ::sibyl::Result<Option<{struct}>> {{
+                let stmt = self.session.prepare(\"SELECT * FROM {table} WHERE {name} = :ID\")?;
                 let rows = stmt.query((\"ID\", id))?;
                 if let Some(row) = rows.next()? {{
-                    Ok(Some({table_name}  {{ {fields} }}))
+                    Ok(Some({struct}  {{ {fields} }}))
                 }} else {{
                     Ok(None)
                 }}
-            }}                    
-        "),
-        None => "".to_string(),
+            }}",
+                typ = i.field_type,
+                struct = struct_name,
+                table = table_name,
+                name = column_name
+            )
+        }
+        None => String::new(),
     };
     let output = format!(
-        "       
-        pub struct {table_name}Repository<'a> {{
-            session: &'a ::sibyl::Session<'a>,
-        }}
-        
-        impl<'a> {table_name}Repository<'a> {{
-            pub fn new(session: &'a ::sibyl::Session<'a>) -> Self {{
-                Self {{ session }}
-            }}
-            
-            #[cfg(feature = \"nonblocking\")]
-            pub async fn find_all(&'a self) -> ::sibyl::Result<Vec<{table_name}>> {{
-                let stmt = self.session.prepare(\"SELECT * FROM {table_name}\").await?;
-                let rows = stmt.query(()).await?;
-                let mut result = vec![];
-                while let Some(row) = rows.next().await? {{
-                    result.push(
-                        {table_name} {{
-                            {fields}  
-                        }}
-                    );
-                }}
-                Ok(result)
+        "
+            pub struct {struct_name}Repository<'a> {{
+                session: sibyl::Session<'a>    
             }}
 
-            #[cfg(feature = \"blocking\")]
-            pub fn find_all(&'a self) -> ::sibyl::Result<Vec<{table_name}>> {{
-                let stmt = self.session.prepare(\"SELECT * FROM {table_name}\")?;
-                let rows = stmt.query(())?;
-                let mut result = vec![];
-                while let Some(row) = rows.next()? {{
-                    result.push(
-                        {table_name} {{
-                            {fields}
-                        }}
-                    );
+            impl<'a> {struct_name}Repository<'a> {{
+               #[cfg(feature = \"nonblocking\")]
+                pub async fn find_all(&'a self) -> ::sibyl::Result<Vec<{struct_name}>> {{
+                    let stmt = self.session.prepare(\"SELECT * FROM {table_name}\").await?;
+                    let rows = stmt.query(()).await?;
+                    let mut result = vec![];
+                    while let Some(row) = rows.next().await? {{
+                        result.push(
+                            {struct_name} {{ {fields} }}
+                        );
+                    }}
+                    Ok(result)
                 }}
-            }}
 
-            {id_dependent_code}
-        }}"
+                #[cfg(feature = \"blocking\")]
+                pub fn find_all(&'a self) -> ::sibyl::Result<Vec<{struct_name}>> {{
+                    let stmt = self.session.prepare(\"SELECT * FROM {table_name}\")?;
+                    let rows = stmt.query(())?;
+                    let mut result = vec![];
+                    while let Some(row) = rows.next()? {{
+                        result.push(
+                            {struct_name} {{ {fields} }}
+                        );
+                    }}
+                    Ok(result)
+                }} 
+
+                {id_dependent_code }
+            }}
+        "
     );
     output.parse().unwrap()
 }
