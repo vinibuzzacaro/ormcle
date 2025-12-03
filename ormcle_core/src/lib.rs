@@ -1,13 +1,31 @@
-use ormcle_macro::Table;
+use ormcle_macro::{Id, Table, Test};
 
 #[derive(Table, Debug)]
 #[ormcle(table_name = "CUSTOMERS")]
 pub struct CustomersStruct {
     #[ormcle(primary_key, column_name = "CUSTOMER_ID")]
     id: i32,
-    email_address: Option<String>,
-    full_name: String,
+    #[ormcle(column_name = "EMAIL_ADDRESS")]
+    email: Option<String>,
+    #[ormcle(column_name = "FULL_NAME")]
+    name: String,
 }
+
+#[derive(Debug, Test)]
+struct OrderId {
+    order_id: i32,
+    line_item_id: i32,
+}
+
+// #[derive(Debug, Table)]
+// struct Order {
+//     // #[ormcle(primary_key)]
+//     // id: OrderId,
+//     product_id: i32,
+//     unit_price: f32,
+//     quantity: f32,
+//     shipment_id: i32,
+// }
 
 #[cfg(test)]
 mod tests {

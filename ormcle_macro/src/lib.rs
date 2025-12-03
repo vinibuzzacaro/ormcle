@@ -1,4 +1,123 @@
-use proc_macro::{Group, TokenStream, TokenTree};
+use std::str::FromStr;
+
+use proc_macro::{Delimiter, Group, TokenStream, TokenTree, token_stream::IntoIter};
+
+macro_rules! push_field {
+    ($field_name: expr, $column_name: expr, $str: expr) => {{
+        $str.push_str(&$field_name);
+        $str.push_str(": row.get(\"");
+        $str.push_str(&$column_name);
+        $str.push_str("\")?,");
+    }};
+}
+
+#[derive(Debug)]
+enum OrmcleError {
+    InvalidKey,
+    InvalidFlag,
+}
+
+#[derive(Debug)]
+enum Key {
+    TableName,
+    ColumnName,
+}
+
+#[derive(Debug)]
+enum Flag {
+    PrimaryKey,
+}
+
+#[derive(Debug)]
+struct KeyValue {
+    key: Key,
+    value: String,
+}
+
+#[derive(Debug)]
+enum Attr {
+    Flag(Flag),
+    KeyValue(KeyValue),
+}
+
+struct AttrIterator {
+    ts: IntoIter,
+}
+
+impl FromStr for Key {
+    type Err = OrmcleError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "table_name" => Ok(Self::TableName),
+            "column_name" => Ok(Self::ColumnName),
+            _ => Err(OrmcleError::InvalidKey),
+        }
+    }
+}
+
+impl FromStr for Flag {
+    type Err = OrmcleError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "primary_key" => Ok(Self::PrimaryKey),
+            _ => Err(OrmcleError::InvalidFlag),
+        }
+    }
+}
+
+impl From<Group> for AttrIterator {
+    fn from(value: Group) -> Self {
+        Self {
+            ts: value.stream().into_iter(),
+        }
+    }
+}
+
+impl Iterator for AttrIterator {
+    type Item = Result<Attr, OrmcleError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.ts.next() {
+                Some(TokenTree::Ident(i)) => {
+                    let key = i.to_string();
+                    let maybe_value = self
+                        .ts
+                        .next()
+                        .and_then(|tt| match tt {
+                            TokenTree::Punct(p) if p.as_char().eq(&'=') => self.ts.next(),
+                            _ => None,
+                        })
+                        .and_then(|tt| match tt {
+                            TokenTree::Literal(l) => Some(l.to_string().replace("\"", "")),
+                            _ => None,
+                        });
+                    let attr = match maybe_value {
+                        Some(value) => {
+                            let key = match key.parse() {
+                                Ok(k) => k,
+                                Err(e) => break Some(Err(e)),
+                            };
+                            Attr::KeyValue(KeyValue { key, value })
+                        }
+                        None => {
+                            let flag = match key.parse() {
+                                Ok(f) => f,
+                                Err(e) => break Some(Err(e)),
+                            };
+                            Attr::Flag(flag)
+                        }
+                    };
+                    break Some(Ok(attr));
+                }
+                Some(_) => continue,
+                None => break None,
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 enum Attribute {
@@ -24,6 +143,113 @@ struct Field {
     attr: Option<Attribute>,
 }
 
+struct FieldIterator {
+    ts: IntoIter,
+}
+
+impl From<Group> for FieldIterator {
+    fn from(value: Group) -> Self {
+        Self {
+            ts: value.stream().into_iter(),
+        }
+    }
+}
+
+impl Iterator for FieldIterator {
+    type Item = Field;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut attr = Attribute::default_field();
+        let mut some_element = false;
+        loop {
+            match self.ts.next() {
+                Some(TokenTree::Punct(p)) if p.as_char().eq(&'#') => {
+                    let mut group = match self.ts.next() {
+                        Some(TokenTree::Group(g)) => g.stream().into_iter(),
+                        _ => unreachable!(),
+                    };
+                    let maybe_iter = group
+                        .next()
+                        .filter(|tt| matches!(tt, TokenTree::Ident(i) if i.to_string() == "ormcle"))
+                        .and_then(|_| group.next())
+                        .and_then(|tt| match tt {
+                            TokenTree::Group(g) => Some(g),
+                            _ => None,
+                        })
+                        .map(|g| AttrIterator::from(g));
+                    if let Some(mut attr_iter) = maybe_iter {
+                        while let Some(attribute) = attr_iter.next() {
+                            some_element = true;
+                            match attribute {
+                                Ok(Attr::Flag(Flag::PrimaryKey)) => attr = attr.with_primary_key(),
+                                Ok(Attr::KeyValue(KeyValue {
+                                    key: Key::ColumnName,
+                                    value,
+                                })) => attr = attr.with_column_name(value),
+                                Ok(_) => unreachable!(),
+                                Err(e) => panic!("{e:?}"),
+                            }
+                        }
+                    }
+                }
+                Some(TokenTree::Ident(i)) => {
+                    let field_name = i.to_string();
+                    let colon_found = self
+                        .ts
+                        .next()
+                        .map(|tt| matches!(tt, TokenTree::Punct(p) if p.as_char().eq(&':')))
+                        .unwrap_or(false);
+                    if !colon_found {
+                        return None;
+                    }
+                    let field_type = match self.ts.next() {
+                        Some(TokenTree::Ident(i)) => {
+                            let mut ty = i.to_string();
+                            let opening_bracket = self
+                                .ts
+                                .next()
+                                .map(|tt| matches!(tt, TokenTree::Punct(p) if p.as_char().eq(&'<')))
+                                .unwrap_or(false);
+                            if !opening_bracket {
+                                ty
+                            } else {
+                                ty.push('<');
+                                loop {
+                                    match self.ts.next() {
+                                        Some(TokenTree::Punct(p)) => {
+                                            let p_as_char = p.as_char();
+                                            let type_end = p_as_char.eq(&'>');
+                                            ty.push(p_as_char);
+                                            if type_end {
+                                                break;
+                                            }
+                                        }
+                                        Some(TokenTree::Ident(i)) => {
+                                            ty.push_str(i.to_string().as_str());
+                                        }
+                                        None => return None,
+                                        _ => continue,
+                                    }
+                                }
+                                ty
+                            }
+                        }
+                        _ => continue,
+                    };
+                    let attr = some_element.then_some(attr);
+                    return Some(Self::Item {
+                        field_name,
+                        field_type,
+                        attr,
+                    });
+                }
+                Some(_) => continue,
+                None => return None,
+            }
+        }
+    }
+}
+
 impl Field {
     fn is_pk(&self) -> bool {
         self.attr.as_ref().map_or(false, |attr| match attr {
@@ -41,18 +267,17 @@ impl Field {
                         Some(TokenTree::Group(g)) => g.stream().into_iter(),
                         _ => unreachable!(),
                     };
-                    let ormcle_found = group.next().map_or(
-                        false,
-                        |tt| matches!(tt, TokenTree::Ident(i) if i.to_string().eq("ormcle")),
-                    );
-                    if !ormcle_found {
-                        continue;
+                    let maybe_group = group
+                        .next()
+                        .filter(|tt| matches!(tt, TokenTree::Ident(i) if i.to_string() == "ormcle"))
+                        .and_then(|_| group.next())
+                        .and_then(|tt| match tt {
+                            TokenTree::Group(g) => Some(g),
+                            _ => None,
+                        });
+                    if let Some(attr_group) = maybe_group {
+                        attr = Attribute::try_parse_field(attr_group);
                     }
-                    let attr_group = match group.next() {
-                        Some(TokenTree::Group(g)) => g,
-                        _ => unreachable!(),
-                    };
-                    attr = Attribute::try_parse_field(attr_group);
                 }
                 TokenTree::Ident(i) => {
                     let field_name = i.to_string();
@@ -96,6 +321,9 @@ impl Field {
                         }
                         _ => unreachable!(),
                     };
+                    if attr.is_some() {
+                        return None;
+                    }
                     return Some(Self {
                         field_name,
                         field_type,
@@ -254,6 +482,103 @@ impl Entity {
     }
 }
 
+#[proc_macro_derive(Test)]
+pub fn derive_test(input: TokenStream) -> TokenStream {
+    let mut ts = input.into_iter();
+    let struct_name = loop {
+        match ts.next() {
+            Some(TokenTree::Ident(i)) if i.to_string().eq("struct") => match ts.next() {
+                Some(TokenTree::Ident(i)) => break i.to_string(),
+                _ => panic!("Expected struct name"),
+            },
+            None => panic!("Expected struct definition"),
+            _ => continue,
+        }
+    };
+    let group = loop {
+        match ts.next() {
+            Some(TokenTree::Group(g)) if g.delimiter().eq(&Delimiter::Brace) => {
+                break g;
+            }
+            None => panic!("Expected fields definition"),
+            _ => continue,
+        }
+    };
+    let mut field_iter = FieldIterator::from(group);
+    let mut output = format!(
+        "impl {struct_name} {{
+            fn get_row(row: sibyl::Row<'_>) -> sibyl::Result<Self> {{
+                Ok(Self {{"
+    );
+    while let Some(field) = field_iter.next() {
+        match field.attr {
+            Some(attr) => push_field!(
+                field.field_name,
+                match attr {
+                    Attribute::Struct { .. } => unreachable!(),
+                    Attribute::Field { column_name, .. } => column_name.unwrap_or(field.field_name),
+                },
+                output
+            ),
+            None => push_field!(field.field_name, field.field_name, output),
+        }
+    }
+    output.push_str("})}}");
+    dbg!(&output);
+    output.parse().unwrap()
+}
+
+#[proc_macro_derive(Id)]
+pub fn derive_id(input: TokenStream) -> TokenStream {
+    let mut ts = input.into_iter();
+    let struct_name = loop {
+        match ts.next() {
+            Some(TokenTree::Ident(i)) if i.to_string().eq("struct") => match ts.next() {
+                Some(TokenTree::Ident(i)) => break i.to_string(),
+                _ => panic!("Expected struct name"),
+            },
+            None => panic!("Expected struct definition"),
+            _ => continue,
+        }
+    };
+    let mut inner_ts = loop {
+        match ts.next() {
+            Some(TokenTree::Group(g)) if g.delimiter().eq(&proc_macro::Delimiter::Brace) => {
+                break g.stream().into_iter();
+            }
+            None => continue,
+            _ => panic!("Expected fields definition"),
+        }
+    };
+    let mut fields: Vec<(String, String)> = vec![];
+    while let Some(tt) = inner_ts.next() {
+        match tt {
+            TokenTree::Ident(i) => {
+                let field = i.to_string();
+                let field_type = inner_ts
+                    .next()
+                    .and_then(|tt| match tt {
+                        TokenTree::Punct(p) if p.as_char().eq(&':') => inner_ts.next(),
+                        _ => None,
+                    })
+                    .and_then(|tt| match tt {
+                        TokenTree::Ident(i) => Some(i.to_string()),
+                        _ => None,
+                    });
+                match field_type {
+                    Some(ft) => fields.push((field, ft)),
+                    None => panic!("Expected field type"),
+                }
+            }
+            _ => continue,
+        }
+    }
+    if fields.is_empty() {
+        panic!("Expected fields");
+    }
+    "const s: &'static str = \"oi\";".parse().unwrap()
+}
+
 #[proc_macro_derive(Table, attributes(ormcle))]
 pub fn derive_table(input: TokenStream) -> TokenStream {
     let mut ts = input.into_iter();
@@ -267,15 +592,17 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
         .unwrap_or(entity.struct_name.clone());
     let struct_name = entity.struct_name;
     let mut fields = String::new();
-    let mut ts = loop {
+    let group = loop {
         match ts.next() {
-            Some(TokenTree::Group(g)) => break g.stream().into_iter(),
+            Some(TokenTree::Group(g)) => break g,
             None => unreachable!(),
             _ => continue,
         }
     };
     let mut id: Option<Field> = None;
-    while let Some(field) = Field::try_from_iter(&mut ts) {
+    let mut field_iter = FieldIterator::from(group);
+    while let Some(field) = field_iter.next() {
+        dbg!(&field);
         let column_name = field
             .attr
             .as_ref()
@@ -284,10 +611,7 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
                 Attribute::Field { column_name, .. } => column_name.clone(),
             })
             .unwrap_or(field.field_name.to_uppercase());
-        fields.push_str(&field.field_name);
-        fields.push_str(": row.get(\"");
-        fields.push_str(&column_name);
-        fields.push_str("\")?,");
+        push_field!(field.field_name, column_name, fields);
         match (&id, field.is_pk()) {
             (None, true) => id = Some(field),
             (Some(_), true) => panic!("Only one field can be flagged as ID"),
@@ -337,7 +661,7 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
     let output = format!(
         "
             pub struct {struct_name}Repository<'a> {{
-                session: sibyl::Session<'a>    
+                session: sibyl::Session<'a>
             }}
 
             impl<'a> {struct_name}Repository<'a> {{
@@ -365,7 +689,7 @@ pub fn derive_table(input: TokenStream) -> TokenStream {
                         );
                     }}
                     Ok(result)
-                }} 
+                }}
 
                 {id_dependent_code }
             }}
